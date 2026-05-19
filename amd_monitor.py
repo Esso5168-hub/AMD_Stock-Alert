@@ -79,7 +79,7 @@ ALERT_LEVELS = {
     },
 }
 
-CHECK_INTERVAL_SECONDS = 300   # เช็คทุก 5 นาที
+CHECK_INTERVAL_SECONDS = 900   # เช็คทุก 5 นาที
 ALERT_COOLDOWN_SECONDS = 3600  # ไม่ส่งซ้ำภายใน 1 ชั่วโมง
 STATE_FILE = "alert_state.json"
 
