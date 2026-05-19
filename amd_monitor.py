@@ -14,8 +14,9 @@ import pytz
 # ============================================================
 # ⚙️  CONFIG — แก้ไขตรงนี้ก่อนรัน
 # ============================================================
-TELEGRAM_BOT_TOKEN = "8519362906:AAFgoMaiAZ-DR3_b705oEekznBk0YtL91Yc"   # จาก @BotFather
-TELEGRAM_CHAT_ID   = "@Doraemonn888_bot"     # จาก @userinfobot
+import os
+TELEGRAM_BOT_TOKEN = os.environ["8519362906:AAFgoMaiAZ-DR3_b705oEekznBk0YtL91Yc"]   # จาก @BotFather
+TELEGRAM_CHAT_ID   = os.environ["@Doraemonn888_bot"]     # จาก @userinfobot
 
 # Alert Levels — ปรับได้ตามต้องการ
 ALERT_LEVELS = {
