@@ -3,7 +3,6 @@ AMD Price Alert Bot — Alpha OS
 ส่งแจ้งเตือนผ่าน Telegram เมื่อ AMD แตะ alert levels
 """
 
-import yfinance as yf
 import requests
 import json
 import os
@@ -104,9 +103,14 @@ def send_telegram(message: str) -> bool:
 
 def get_amd_price() -> float | None:
     try:
-        ticker = yf.Ticker("AMD")
-        price = ticker.fast_info.last_price
-        return round(float(price), 2)
+        api_key = os.environ["FINNHUB_API_KEY"]
+        url = f"https://finnhub.io/api/v1/quote?symbol=AMD&token={api_key}"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        price = data.get("c")  # c = current price
+        if price and price > 0:
+            return round(float(price), 2)
+        return None
     except Exception as e:
         print(f"[Price Error] {e}")
         return None
