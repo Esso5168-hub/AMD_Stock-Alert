@@ -1,1 +1,1 @@
-worker: python amd_monitor.py
+worker: python alpha_monitor.py
