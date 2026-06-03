@@ -1,231 +1,269 @@
 """
-AMD Price Alert Bot — Alpha OS v2
-- ส่งแจ้งเตือนผ่าน Telegram เมื่อ AMD แตะ alert levels
-- Daily heartbeat ทุกเช้า 9:00 ไทย เพื่อยืนยันว่า bot ยังทำงาน
-- ใช้ Finnhub API (เสถียรกว่า yfinance บน cloud)
+╔══════════════════════════════════════════════════════════════╗
+║         ALPHA OS — Multi-Stock Price Alert Monitor           ║
+║         AMD + NVDA | Telegram | Railway.app                  ║
+╚══════════════════════════════════════════════════════════════╝
+
+ALERT LEVELS:
+  AMD  — Entry Zone B ($505), Stop ($491), TP1 ($527), TP2 ($550)
+  NVDA — Zone C Entry ($207–209), GEX Put Wall ($207.50),
+          Stop ($202.50), TP1 ($219), TP2 ($228)
 """
 
-import requests
-import json
 import os
+import json
 import time
 from datetime import datetime
+
 import pytz
+import yfinance as yf
+import requests
 
-# ============================================================
-# ⚙️  CONFIG — อ่านจาก Railway Environment Variables
-# ============================================================
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
-FINNHUB_API_KEY    = os.environ["FINNHUB_API_KEY"]
+# ──────────────────────────────────────────────
+# CONFIG — ใส่ค่าตรงนี้ หรือตั้งเป็น ENV variable บน Railway
+# ──────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TOKEN_HERE")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID_HERE")
 
-# Alert Levels — อัพเดทตามราคาปัจจุบัน (AMD ~$518, ATH zone)
-ALERT_LEVELS = {
-    "🚀 ATH Breakout Confirm": {
-        "price": 530,
-        "direction": "above",
-        "message": (
-            "AMD แตะ <b>$530</b> — ATH Breakout Zone!\n"
-            "⚠️ รอ <b>ปิดเหนือ $530</b> + volume ก่อนเข้า\n"
-            "❌ แตะแล้วลง = fake breakout อย่าเข้า\n"
-            "🛑 Stop: $510  |  🎯 Target: $560–580"
-        ),
-    },
-    "📈 Take Profit 1": {
-        "price": 550,
-        "direction": "above",
-        "message": (
-            "🎉 AMD แตะ <b>$550</b> — TP1!\n"
-            "→ ขาย 1/3 ของ position\n"
-            "→ Trail stop ขยับขึ้นมา $525"
-        ),
-    },
-    "🚀 Take Profit 2": {
-        "price": 580,
-        "direction": "above",
-        "message": (
-            "🚀 AMD แตะ <b>$580</b> — TP2!\n"
-            "→ ขายอีก 1/3\n"
-            "→ Runner ที่เหลือ trail $560"
-        ),
-    },
-    "🎯 Pullback Entry": {
-        "price": 510,
-        "direction": "below",
-        "message": (
-            "AMD ย่อลง <b>$510</b> — Pullback Entry Zone\n"
-            "✅ Former resistance flip support\n"
-            "🛑 Stop: $493  |  🎯 Target: $530–550"
-        ),
-    },
-    "💎 Best Entry": {
-        "price": 505,
-        "direction": "below",
-        "message": (
-            "AMD แตะ <b>$505</b> — Strong Support / Best Entry\n"
-            "R:R กว้างที่สุด\n"
-            "🛑 Stop: $493  |  🎯 T1: $530  |  🚀 T2: $550"
-        ),
-    },
-    "⚠️ Trail Stop Warning": {
-        "price": 500,
-        "direction": "below",
-        "message": (
-            "AMD ใกล้ Trail Stop — ราคา <b>$500</b>\n"
-            "→ ถ้ามี position ตั้งแต่ $510+ → เตรียมพร้อม\n"
-            "→ Hard stop อยู่ที่ $493"
-        ),
-    },
-    "🚨 Stop Loss": {
-        "price": 493,
-        "direction": "below",
-        "message": (
-            "🚨 AMD หลุด <b>$493</b>!\n"
-            "<b>STOP — ออก position ทันที</b>\n"
-            "❌ Trend อาจกำลัง break\n"
-            "รอ structure ใหม่ก่อนกลับเข้า"
-        ),
-    },
+CHECK_INTERVAL_SECONDS = 300   # เช็คทุก 5 นาที
+STATE_FILE             = "alert_state.json"
+THAI_TZ                = pytz.timezone("Asia/Bangkok")
+ET_TZ                  = pytz.timezone("America/New_York")
+
+# ──────────────────────────────────────────────
+# ALERT LEVELS — AMD
+# ──────────────────────────────────────────────
+AMD_ALERT_LEVELS = {
+    "👀 AMD ใกล้ Entry Zone":      {"price": 510.00, "direction": "below", "fired": False},
+    "🎯 AMD Entry Zone B":         {"price": 505.00, "direction": "below", "fired": False},
+    "⚠️ AMD ใกล้ Stop Loss":       {"price": 494.00, "direction": "below", "fired": False},
+    "🚨 AMD Stop Loss":            {"price": 491.00, "direction": "below", "fired": False},
+    "📈 AMD TP1":                  {"price": 527.00, "direction": "above", "fired": False},
+    "🚀 AMD TP2":                  {"price": 550.00, "direction": "above", "fired": False},
 }
 
-CHECK_INTERVAL_SECONDS = 900   # เช็คทุก 15 นาที
-ALERT_COOLDOWN_SECONDS = 3600  # ไม่ส่ง alert ซ้ำภายใน 1 ชั่วโมง
-HEARTBEAT_HOUR_THAI    = 9     # ส่ง daily heartbeat ทุกเช้า 9:00 ไทย
-STATE_FILE             = "alert_state.json"
+# ──────────────────────────────────────────────
+# ALERT LEVELS — NVDA Zone C
+# ──────────────────────────────────────────────
+NVDA_ALERT_LEVELS = {
+    "👀 NVDA Pullback มา Zone":    {"price": 212.00, "direction": "below", "fired": False},
+    "📍 NVDA Zone C เริ่ม":        {"price": 209.00, "direction": "below", "fired": False},
+    "🎯 NVDA Best Entry (GEX Wall)":{"price": 207.50, "direction": "below", "fired": False},
+    "⚠️ NVDA ใกล้ Stop Loss":      {"price": 204.00, "direction": "below", "fired": False},
+    "🚨 NVDA Stop Loss":           {"price": 202.50, "direction": "below", "fired": False},
+    "📈 NVDA TP1":                 {"price": 219.00, "direction": "above", "fired": False},
+    "🚀 NVDA TP2":                 {"price": 228.00, "direction": "above", "fired": False},
+    "💥 NVDA ATH Zone":            {"price": 232.00, "direction": "above", "fired": False},
+}
 
-THAI_TZ = pytz.timezone("Asia/Bangkok")
-ET_TZ   = pytz.timezone("America/New_York")
-# ============================================================
+# ──────────────────────────────────────────────
+# ALERT CONTEXT MESSAGES
+# ──────────────────────────────────────────────
+AMD_CONTEXT = {
+    "👀 AMD ใกล้ Entry Zone": (
+        "📍 <b>AMD กำลัง pullback มา Entry Zone</b>\n"
+        "├ Target entry: $505 (Friday low support)\n"
+        "└ เปิดจอ TradingView เช็ค CVD + VWAP"
+    ),
+    "🎯 AMD Entry Zone B": (
+        "🎯 <b>AMD แตะ Entry Zone B $505</b>\n"
+        "├ Friday low = key support thesis ✅\n"
+        "├ Stop: $491 (ห่าง ~2.8%)\n"
+        "├ TP1: $527 (+4.4%) | TP2: $550 (+8.9%)\n"
+        "├ R:R = 2.4:1 ✅\n"
+        "└ ⚡ รอ CVD บวก + hold VWAP ก่อน entry"
+    ),
+    "⚠️ AMD ใกล้ Stop Loss": (
+        "⚠️ <b>AMD ใกล้ Stop $491</b>\n"
+        "├ Monitor closely\n"
+        "└ เตรียม exit ถ้าแตะ $491"
+    ),
+    "🚨 AMD Stop Loss": (
+        "🚨 <b>AMD แตะ Hard Stop $491</b>\n"
+        "├ ออกทันที — ไม่ negotiate\n"
+        "└ Thesis invalidated | Preserve capital"
+    ),
+    "📈 AMD TP1": (
+        "📈 <b>AMD แตะ TP1 $527</b>\n"
+        "├ ขาย 1/3 ล็อคกำไร\n"
+        "├ ย้าย stop → $510 (breakeven+)\n"
+        "└ Runner ไป TP2 $550"
+    ),
+    "🚀 AMD TP2": (
+        "🚀 <b>AMD แตะ TP2 $550!</b>\n"
+        "├ ขายอีก 1/3 หรือทั้งหมด\n"
+        "└ Trail stop runner ถ้าจะถือต่อ"
+    ),
+}
 
+NVDA_CONTEXT = {
+    "👀 NVDA Pullback มา Zone": (
+        "👀 <b>NVDA กำลัง pullback มา Zone C</b>\n"
+        "├ ยังไม่ถึง entry ($207–209)\n"
+        "├ เริ่มเฝ้าดู price action\n"
+        "└ เตรียม order ใกล้ $209"
+    ),
+    "📍 NVDA Zone C เริ่ม": (
+        "📍 <b>NVDA เข้า Zone C Entry Range $207–209</b>\n"
+        "├ ยังไม่ถึง best entry ($207.50)\n"
+        "├ เปิดจอ TradingView เช็ค VWAP + CVD\n"
+        "└ รอ confirmation — อย่ารีบ"
+    ),
+    "🎯 NVDA Best Entry (GEX Wall)": (
+        "🎯 <b>NVDA แตะ GEX Put Wall $207.50 — BEST ENTRY</b>\n"
+        "├ Stop: $202.50 (ห่าง ~2.5%)\n"
+        "├ TP1: $219 (+5.3%) | TP2: $228 (+9.4%)\n"
+        "├ R:R = 3.2:1 ✅✅\n"
+        "└ ⚡ รอ reversal candle + CVD กลับบวก"
+    ),
+    "⚠️ NVDA ใกล้ Stop Loss": (
+        "⚠️ <b>NVDA ใกล้ Stop $202.50</b>\n"
+        "├ Monitor closely\n"
+        "└ เตรียม exit ถ้าแตะ $202.50"
+    ),
+    "🚨 NVDA Stop Loss": (
+        "🚨 <b>NVDA แตะ Hard Stop $202.50</b>\n"
+        "├ ออกทันที — ไม่ negotiate\n"
+        "└ Thesis invalidated | Preserve capital"
+    ),
+    "📈 NVDA TP1": (
+        "📈 <b>NVDA แตะ TP1 $219</b>\n"
+        "├ ขาย 1/3 ล็อคกำไร\n"
+        "├ ย้าย stop → breakeven\n"
+        "└ Runner ไป TP2 $228"
+    ),
+    "🚀 NVDA TP2": (
+        "🚀 <b>NVDA แตะ TP2 $228!</b>\n"
+        "├ ขายอีก 1/3 หรือทั้งหมด\n"
+        "└ Trail stop runner ไป $232+"
+    ),
+    "💥 NVDA ATH Zone": (
+        "💥 <b>NVDA $232 — ATH Zone Retest!</b>\n"
+        "├ All-Time High = $235.74\n"
+        "├ Momentum สูงมาก\n"
+        "└ Hold runner หรือขายหมดตามแผน"
+    ),
+}
 
+# ──────────────────────────────────────────────
+# TELEGRAM
+# ──────────────────────────────────────────────
 def send_telegram(message: str) -> bool:
-    """ส่งข้อความผ่าน Telegram Bot"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id":    TELEGRAM_CHAT_ID,
+        "text":       message,
+        "parse_mode": "HTML",
+    }
     try:
-        r = requests.post(
-            url,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
-            timeout=10,
-        )
+        r = requests.post(url, json=payload, timeout=10)
         return r.status_code == 200
     except Exception as e:
-        print(f"[Telegram Error] {e}")
+        print(f"[Telegram] Error: {e}")
         return False
 
-
-def get_amd_price() -> float | None:
-    """ดึงราคา AMD ปัจจุบันจาก Finnhub"""
+# ──────────────────────────────────────────────
+# PRICE FETCH
+# ──────────────────────────────────────────────
+def get_price(ticker: str) -> float | None:
     try:
-        url = f"https://finnhub.io/api/v1/quote?symbol=AMD&token={FINNHUB_API_KEY}"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        price = data.get("c")  # c = current price
-        if price and price > 0:
-            return round(float(price), 2)
-        return None
+        data = yf.Ticker(ticker).history(period="1d", interval="1m")
+        if not data.empty:
+            return round(float(data["Close"].iloc[-1]), 2)
     except Exception as e:
-        print(f"[Price Error] {e}")
-        return None
+        print(f"[{ticker}] Error ดึงราคา: {e}")
+    return None
 
-
+# ──────────────────────────────────────────────
+# MARKET HOURS CHECK
+# ──────────────────────────────────────────────
 def is_market_open() -> bool:
-    """เช็คว่าตลาด US เปิดอยู่ไหม (Mon-Fri 9:30-16:00 ET)"""
-    now = datetime.now(ET_TZ)
-    if now.weekday() >= 5:  # Saturday, Sunday
+    now_et = datetime.now(ET_TZ)
+    if now_et.weekday() >= 5:           # เสาร์-อาทิตย์
         return False
-    open_time  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
-    close_time = now.replace(hour=16, minute=0,  second=0, microsecond=0)
-    return open_time <= now <= close_time
+    market_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return market_open <= now_et <= market_close
 
-
+# ──────────────────────────────────────────────
+# STATE (persist fired alerts ข้ามรอบ)
+# ──────────────────────────────────────────────
 def load_state() -> dict:
-    """โหลด state (alert cooldown, heartbeat tracking)"""
-    if os.path.exists(STATE_FILE):
+    try:
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {}
-
+    except Exception:
+        return {}
 
 def save_state(state: dict):
-    """บันทึก state ลงไฟล์"""
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+        json.dump(state, f, indent=2)
 
+# ──────────────────────────────────────────────
+# ALERT ENGINE (generic — ใช้ได้ทั้ง AMD และ NVDA)
+# ──────────────────────────────────────────────
+def check_alerts(ticker: str, price: float, levels: dict, context_map: dict, state: dict) -> dict:
+    key = f"{ticker}_alerts"
+    alerts = state.get(key, {name: {"fired": False} for name in levels})
 
-def check_and_fire_alerts(price: float, state: dict) -> dict:
-    """เช็คทุก alert level และส่ง Telegram ถ้าถึงเงื่อนไข"""
-    now = time.time()
-    for name, cfg in ALERT_LEVELS.items():
-        hit = (
+    for name, cfg in levels.items():
+        if alerts.get(name, {}).get("fired", False):
+            continue
+
+        triggered = (
             (cfg["direction"] == "below" and price <= cfg["price"]) or
             (cfg["direction"] == "above" and price >= cfg["price"])
         )
-        if hit:
-            last_sent = state.get(name, 0)
-            if now - last_sent >= ALERT_COOLDOWN_SECONDS:
-                thai_time = datetime.now(THAI_TZ).strftime("%H:%M")
-                msg = (
-                    f"⚡ <b>{name}</b>\n"
-                    f"💰 AMD: <b>${price}</b>\n"
-                    f"🕐 {thai_time} (เวลาไทย)\n\n"
-                    f"{cfg['message']}"
-                )
-                if send_telegram(msg):
-                    state[name] = now
-                    print(f"  ✅ Alert sent: {name} @ ${price}")
+        if not triggered:
+            continue
+
+        direction_text = (
+            f"⬇ ลงถึง ${cfg['price']}" if cfg["direction"] == "below"
+            else f"⬆ ขึ้นถึง ${cfg['price']}"
+        )
+        context = context_map.get(name, "")
+        thai_time = datetime.now(THAI_TZ).strftime("%H:%M")
+
+        message = (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{name}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 <b>{ticker}</b> ราคา <b>${price}</b>\n"
+            f"{direction_text}\n\n"
+            f"{context}\n\n"
+            f"🕐 {thai_time} เวลาไทย"
+        )
+        send_telegram(message)
+        alerts[name] = {"fired": True}
+        print(f"[{ticker} ALERT] {name} fired at ${price}")
+
+    state[key] = alerts
     return state
 
-
-def send_heartbeat(state: dict) -> dict:
-    """ส่ง daily heartbeat ทุกเช้า 9:00 ไทย เพื่อยืนยันว่า bot ทำงาน"""
-    now_thai = datetime.now(THAI_TZ)
-    today_key = f"heartbeat_{now_thai.strftime('%Y-%m-%d')}"
-
-    # ส่งแล้ววันนี้ → skip
-    if state.get(today_key):
-        return state
-
-    # ยังไม่ถึงเวลา 9:00 → skip
-    if now_thai.hour < HEARTBEAT_HOUR_THAI:
-        return state
-
-    # ดึงราคาล่าสุด (Finnhub ใช้ได้แม้ตลาดปิด - คืน last close)
-    price = get_amd_price()
-    price_str = f"${price}" if price else "N/A"
-    market_status = "🟢 ตลาดเปิด" if is_market_open() else "🔴 ตลาดปิด"
-
-    msg = (
-        f"🤖 <b>AMD Monitor Daily Check</b>\n\n"
-        f"💰 ราคาล่าสุด: <b>{price_str}</b>\n"
-        f"📊 Bot: ทำงานปกติ ✅\n"
-        f"{market_status}\n"
-        f"🕐 {now_thai.strftime('%H:%M')} (Thai)\n"
-        f"📅 {now_thai.strftime('%a, %d %b %Y')}"
-    )
-
-    if send_telegram(msg):
-        state[today_key] = True
-        print(f"  ✅ Heartbeat sent at {now_thai.strftime('%H:%M')}")
-
-    return state
-
-
+# ──────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────
 def main():
-    print("=" * 50)
-    print("  AMD Price Monitor — Alpha OS v2")
-    print("=" * 50)
+    print("=" * 55)
+    print("  ALPHA OS — Multi-Stock Monitor")
+    print("  AMD + NVDA | Telegram Alerts")
+    print("=" * 55)
 
-    # ส่งข้อความยืนยันการเริ่มต้น
-    levels_text = "\n".join(
+    # Startup message
+    amd_lines  = "\n".join(
         f"  {'⬇' if c['direction']=='below' else '⬆'} ${c['price']} — {n}"
-        for n, c in ALERT_LEVELS.items()
+        for n, c in AMD_ALERT_LEVELS.items()
+    )
+    nvda_lines = "\n".join(
+        f"  {'⬇' if c['direction']=='below' else '⬆'} ${c['price']} — {n}"
+        for n, c in NVDA_ALERT_LEVELS.items()
     )
     send_telegram(
-        f"🤖 <b>AMD Monitor v2 เริ่มทำงาน</b>\n\n"
-        f"<b>Alert Levels ใหม่:</b>\n{levels_text}\n\n"
-        f"⏰ เช็คทุก 15 นาที ระหว่างตลาดเปิด\n"
-        f"🌏 US Market = 21:30–04:00 เวลาไทย\n"
-        f"💌 Daily Heartbeat: ทุกเช้า 09:00 (Thai)"
+        f"🤖 <b>Alpha Monitor เริ่มทำงานแล้ว</b>\n\n"
+        f"<b>📈 AMD Levels:</b>\n{amd_lines}\n\n"
+        f"<b>📊 NVDA Levels (Zone C):</b>\n{nvda_lines}\n\n"
+        f"⏰ เช็คทุก 5 นาที ระหว่างตลาดเปิด\n"
+        f"🌏 US Market = 21:30–04:00 เวลาไทย"
     )
 
     state = load_state()
@@ -233,19 +271,25 @@ def main():
     while True:
         thai_time = datetime.now(THAI_TZ).strftime("%H:%M")
 
-        # ส่ง daily heartbeat (เช็คทุกรอบ แต่ส่งครั้งเดียวต่อวันที่ 9:00)
-        state = send_heartbeat(state)
-        save_state(state)
-
-        # เช็คราคาเฉพาะตอนตลาดเปิด
         if is_market_open():
-            price = get_amd_price()
-            if price:
-                print(f"[{thai_time}] AMD = ${price}")
-                state = check_and_fire_alerts(price, state)
-                save_state(state)
+            # ── AMD ──
+            amd_price = get_price("AMD")
+            if amd_price:
+                print(f"[{thai_time}] AMD  = ${amd_price}")
+                state = check_alerts("AMD", amd_price, AMD_ALERT_LEVELS, AMD_CONTEXT, state)
             else:
-                print(f"[{thai_time}] ดึงราคาไม่ได้ — รอรอบถัดไป")
+                print(f"[{thai_time}] AMD  — ดึงราคาไม่ได้")
+
+            # ── NVDA ──
+            nvda_price = get_price("NVDA")
+            if nvda_price:
+                print(f"[{thai_time}] NVDA = ${nvda_price}")
+                state = check_alerts("NVDA", nvda_price, NVDA_ALERT_LEVELS, NVDA_CONTEXT, state)
+            else:
+                print(f"[{thai_time}] NVDA — ดึงราคาไม่ได้")
+
+            save_state(state)
+
         else:
             print(f"[{thai_time}] ตลาดปิดอยู่ — sleeping...")
 
